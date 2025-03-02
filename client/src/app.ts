@@ -3,6 +3,13 @@ import { io, Socket } from 'socket.io-client';
 import { ethers } from 'ethers';
 import { SignClient } from '@walletconnect/sign-client';
 
+interface SafeInfo {
+  owners: string[];
+  threshold: number;
+  balance: string;
+  ensNames: { [address: string]: string | null };
+}
+
 class VimApp {
   private buffer: HTMLDivElement;
   private statusBar: HTMLDivElement;
@@ -22,6 +29,8 @@ class VimApp {
   private provider: ethers.JsonRpcProvider;
   private signClient: any; // WalletConnect SignClient instance
   private sessionTopic: string | null = null; // Store the WalletConnect session topic
+  private isModeSwitch: boolean = false;
+  private cachedSafeInfo: SafeInfo | null = null;
 
   constructor() {
     this.buffer = document.getElementById('buffer') as HTMLDivElement;
@@ -143,6 +152,7 @@ class VimApp {
       { cmd: ':i', desc: 'Display information about the connected Safe wallet (requires :c first).' },
       { cmd: ':wc', desc: 'Connect a signer wallet via WalletConnect to interact with the Safe (requires :c first).' },
       { cmd: ':dc', desc: 'Disconnect the current signer wallet (requires :wc first).' },
+      { cmd: ':t', desc: 'Create a new transaction (requires TX mode, press "e" to switch modes).' },
       { cmd: ':q', desc: 'Clear the buffer screen.' },
       { cmd: ':d', desc: 'Disconnect the Safe wallet and return to the input screen to connect a new Safe.' },
       { cmd: ':h', desc: 'Show this help guide with usage instructions for all commands.' },
@@ -459,7 +469,8 @@ class VimApp {
 
     this.socket.on('safeInfo', async (data: { address: string; owners: string[]; threshold: number }) => {
       // If this is a response to the 'e' key press (mode switch attempt)
-      if (this.mode === 'READ ONLY' && this.signerAddress) {
+      if (this.isModeSwitch && this.mode === 'READ ONLY' && this.signerAddress) {
+        this.isModeSwitch = false; // Reset the flag
         const isOwner = data.owners.map(owner => owner.toLowerCase())
           .includes(this.signerAddress!.toLowerCase());
         
@@ -475,6 +486,41 @@ class VimApp {
           this.buffer.className = 'flex-1 p-4 overflow-y-auto text-yellow-400';
         }
         this.updateStatus();
+        return;
+      }
+
+      // Check if we need to populate the owners dropdown
+      const ownersDropdown = document.getElementById('owners-dropdown');
+      if (ownersDropdown) {
+        // Clear existing options
+        ownersDropdown.innerHTML = '';
+        
+        // Add each owner as an option
+        for (const owner of data.owners) {
+          const option = document.createElement('div');
+          option.className = 'px-4 py-2 text-white hover:bg-gray-600 cursor-pointer transition-colors duration-150';
+          
+          const ensName = await this.resolveEnsName(owner);
+          if (ensName) {
+            option.innerHTML = `
+              <div class="text-sm font-medium text-blue-400">${ensName}</div>
+              <div class="text-xs text-gray-400 font-mono">${owner}</div>
+            `;
+          } else {
+            option.innerHTML = `<div class="text-sm font-mono">${owner}</div>`;
+          }
+          
+          option.addEventListener('click', () => {
+            const input = document.getElementById('tx-to') as HTMLInputElement;
+            if (input) {
+              input.value = owner;
+              ownersDropdown.classList.add('hidden');
+              input.focus();
+            }
+          });
+          
+          ownersDropdown.appendChild(option);
+        }
         return;
       }
 
@@ -622,6 +668,8 @@ class VimApp {
         // Clear buffer before checking ownership
         this.buffer.innerHTML = '';
         
+        // Set flag for mode switch attempt
+        this.isModeSwitch = true;
         // Use getSafeInfo to check ownership
         this.socket.emit('getSafeInfo', { safeAddress: this.safeAddress });
       } else if (!this.signerAddress) {
@@ -682,6 +730,10 @@ class VimApp {
         return;
       }
       this.safeAddress = safeAddress;
+      
+      // Load and cache Safe info
+      await this.loadAndCacheSafeInfo();
+      
       // Resolve ENS for the Safe address
       const ensName = await this.resolveEnsName(safeAddress);
       // Remove the existing input container if it exists
@@ -704,7 +756,17 @@ class VimApp {
         this.buffer.className = 'flex-1 p-4 overflow-y-auto text-yellow-400';
         return;
       }
-      this.socket.emit('getSafeInfo', { safeAddress: this.safeAddress });
+
+      // Use cached data if available
+      if (this.cachedSafeInfo) {
+        this.displaySafeInfo(this.cachedSafeInfo);
+      } else {
+        // Fallback to fetching if cache is empty
+        await this.loadAndCacheSafeInfo();
+        if (this.cachedSafeInfo) {
+          this.displaySafeInfo(this.cachedSafeInfo);
+        }
+      }
     } else if (this.command === ':wc') {
       if (!this.safeAddress) {
         this.buffer.textContent = 'Please connect a Safe address with :c first';
@@ -734,6 +796,9 @@ class VimApp {
     } else if (this.command === ':h') {
       this.showHelpGuide();
     } else if (this.command === ':d') {
+      // Clear cache when disconnecting
+      this.clearSafeInfoCache();
+      
       // First disconnect wallet if connected (like :dc command)
       if (this.signerAddress && this.signClient && this.sessionTopic) {
         try {
@@ -829,14 +894,376 @@ class VimApp {
           }
         });
       }
+    } else if (this.command === ':t') {
+      if (this.mode !== 'TX') {
+        this.buffer.textContent = 'Please switch to TX mode first by pressing "e" key';
+        this.buffer.className = 'flex-1 p-4 overflow-y-auto text-yellow-400';
+        return;
+      }
+      if (!this.safeAddress) {
+        this.buffer.textContent = 'Please connect a Safe address with :c first';
+        this.buffer.className = 'flex-1 p-4 overflow-y-auto text-yellow-400';
+        return;
+      }
+      if (!this.signerAddress) {
+        this.buffer.textContent = 'Please connect wallet with :wc first';
+        this.buffer.className = 'flex-1 p-4 overflow-y-auto text-yellow-400';
+        return;
+      }
+      this.showTransactionScreen();
     } else {
       this.buffer.textContent = `Unknown command: ${this.command}`;
       this.buffer.className = 'flex-1 p-4 overflow-y-auto text-yellow-400';
     }
   }
 
+  private showTransactionScreen(): void {
+    // Clear existing content
+    this.buffer.innerHTML = '';
+    this.buffer.className = 'flex-1 p-4 overflow-y-auto';
+
+    // Create transaction form container
+    const formContainer = document.createElement('div');
+    formContainer.className = 'max-w-2xl mx-auto bg-gray-800 p-6 rounded-lg border border-gray-700 shadow-lg';
+
+    // Create form title
+    const title = document.createElement('h3');
+    title.className = 'text-xl font-bold text-white mb-6';
+    title.textContent = 'New Transaction';
+
+    // Create form
+    const form = document.createElement('form');
+    form.className = 'space-y-6';
+    form.onsubmit = (e) => {
+      e.preventDefault();
+      // Handle form submission here
+      const to = (form.querySelector('#tx-to') as HTMLInputElement).value;
+      const value = (form.querySelector('#tx-value') as HTMLInputElement).value;
+      const data = (form.querySelector('#tx-data') as HTMLTextAreaElement).value;
+
+      // Emit socket event with transaction data
+      this.socket.emit('createTransaction', {
+        safeAddress: this.safeAddress,
+        transaction: {
+          to,
+          value: ethers.parseEther(value || '0'),
+          data: data || '0x',
+        }
+      });
+    };
+
+    // Create form fields
+    const fields = [
+      {
+        id: 'tx-to',
+        label: 'To Address',
+        type: 'text',
+        placeholder: '0x...',
+        required: true
+      },
+      {
+        id: 'tx-value',
+        label: 'Value (ETH)',
+        type: 'text',
+        placeholder: '0.0',
+        step: '0.1',
+        min: '0'
+      },
+      {
+        id: 'tx-data',
+        label: 'Data (hex)',
+        type: 'textarea',
+        placeholder: '0x...',
+        rows: 4
+      }
+    ];
+
+    fields.forEach(field => {
+      const fieldContainer = document.createElement('div');
+      fieldContainer.className = 'relative';
+
+      const label = document.createElement('label');
+      label.htmlFor = field.id;
+      label.className = 'block text-sm font-medium text-gray-300 mb-1';
+      label.textContent = field.label;
+
+      let input;
+      if (field.type === 'textarea') {
+        input = document.createElement('textarea');
+        input.rows = field.rows;
+      } else {
+        input = document.createElement('input');
+        input.type = field.type;
+        if (field.step) input.step = field.step;
+        if (field.min) input.min = field.min;
+      }
+
+      input.id = field.id;
+      input.className = 'w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+      input.placeholder = field.placeholder;
+      if (field.required) input.required = true;
+
+      // Configure decimal handling for ETH value input
+      if (field.id === 'tx-value') {
+        // Create a container for label and balance info
+        const labelContainer = document.createElement('div');
+        labelContainer.className = 'flex items-center justify-between mb-1';
+        
+        // Move the label to the container
+        label.className = 'text-sm font-medium text-gray-300';
+        
+        // Create a container for MAX button and balance
+        const rightContainer = document.createElement('div');
+        rightContainer.className = 'flex items-center gap-2';
+        
+        // Create MAX button
+        const maxButton = document.createElement('button');
+        maxButton.type = 'button';
+        maxButton.className = 'px-2 py-0.5 text-xs bg-gray-600 text-white rounded hover:bg-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500';
+        maxButton.textContent = 'MAX';
+        
+        // Create balance display
+        const balanceDisplay = document.createElement('div');
+        balanceDisplay.className = 'text-xs text-gray-400';
+        balanceDisplay.id = 'safe-balance';
+        balanceDisplay.textContent = 'Loading...';
+        
+        // Add input configuration
+        input.className = 'w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+        input.setAttribute('pattern', '[0-9]*(.[0-9]+)?');
+        input.setAttribute('inputmode', 'decimal');
+        (input as HTMLInputElement).setAttribute('lang', 'en');
+        (input as HTMLInputElement).setAttribute('data-type', 'number');
+        
+        // Use cached balance if available
+        if (this.cachedSafeInfo) {
+          balanceDisplay.textContent = `${this.cachedSafeInfo.balance} ETH`;
+          maxButton.onclick = () => {
+            (input as HTMLInputElement).value = this.cachedSafeInfo!.balance;
+          };
+        } else {
+          // Fallback to fetching if cache is empty
+          this.provider.getBalance(this.safeAddress!).then(balance => {
+            const balanceInEth = ethers.formatEther(balance);
+            balanceDisplay.textContent = `${balanceInEth} ETH`;
+            maxButton.onclick = () => {
+              (input as HTMLInputElement).value = balanceInEth;
+            };
+          }).catch(err => {
+            console.error('Failed to fetch balance:', err);
+            balanceDisplay.textContent = 'Error';
+          });
+        }
+
+        // Add input event listener to format decimal values
+        input.addEventListener('input', (e) => {
+          const target = e.target as HTMLInputElement;
+          let value = target.value;
+          
+          // Remove any non-numeric characters except decimal point
+          value = value.replace(/[^\d.]/g, '');
+          
+          // Ensure only one decimal point
+          const parts = value.split('.');
+          if (parts.length > 2) {
+            value = parts[0] + '.' + parts.slice(1).join('');
+          }
+          
+          // Update the input value
+          target.value = value;
+        });
+
+        // Assemble the components
+        rightContainer.appendChild(balanceDisplay);
+        rightContainer.appendChild(maxButton);
+        labelContainer.appendChild(label);
+        labelContainer.appendChild(rightContainer);
+        
+        fieldContainer.appendChild(labelContainer);
+        fieldContainer.appendChild(input);
+      } else if (field.id === 'tx-to') {
+        // Create a wrapper for the address input and dropdown
+        const addressWrapper = document.createElement('div');
+        addressWrapper.className = 'relative';
+        
+        // Create datalist container that will be styled as a dropdown
+        const ownersDropdown = document.createElement('div');
+        ownersDropdown.className = 'hidden absolute z-10 w-full mt-1 bg-gray-700 border border-gray-600 rounded-md shadow-lg max-h-60 overflow-y-auto';
+        ownersDropdown.id = 'owners-dropdown';
+        
+        // Configure input
+        input.className = 'w-full px-3 py-2 bg-gray-700 border border-gray-600 rounded-md text-white placeholder-gray-400 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent';
+        input.autocomplete = 'off';
+        
+        // Add input event listeners for custom dropdown behavior
+        input.addEventListener('focus', () => {
+          const ownersDropdown = document.getElementById('owners-dropdown');
+          if (ownersDropdown && this.cachedSafeInfo) {
+            // Use cached data for owners dropdown
+            ownersDropdown.innerHTML = '';
+            ownersDropdown.classList.remove('hidden');
+            
+            for (const owner of this.cachedSafeInfo.owners) {
+              const option = document.createElement('div');
+              option.className = 'px-4 py-2 text-white hover:bg-gray-600 cursor-pointer transition-colors duration-150';
+              
+              const ensName = this.cachedSafeInfo.ensNames[owner];
+              if (ensName) {
+                option.innerHTML = `
+                  <div class="text-sm font-medium text-blue-400">${ensName}</div>
+                  <div class="text-xs text-gray-400 font-mono">${owner}</div>
+                `;
+              } else {
+                option.innerHTML = `<div class="text-sm font-mono">${owner}</div>`;
+              }
+              
+              option.addEventListener('click', () => {
+                const input = document.getElementById('tx-to') as HTMLInputElement;
+                if (input) {
+                  input.value = owner;
+                  ownersDropdown.classList.add('hidden');
+                  input.focus();
+                }
+              });
+              
+              ownersDropdown.appendChild(option);
+            }
+          } else {
+            // Fallback to fetching if cache is empty
+            ownersDropdown?.classList.remove('hidden');
+            this.socket.emit('getSafeInfo', { safeAddress: this.safeAddress });
+          }
+        });
+        
+        input.addEventListener('blur', () => {
+          // Delay hiding to allow for click events on the dropdown
+          setTimeout(() => {
+            ownersDropdown.classList.add('hidden');
+          }, 200);
+        });
+        
+        input.addEventListener('input', (e) => {
+          const target = e.target as HTMLInputElement;
+          const value = target.value.toLowerCase();
+          
+          // Show/hide options based on input
+          Array.from(ownersDropdown.children).forEach((option: Element) => {
+            const text = option.textContent?.toLowerCase() || '';
+            if (text.includes(value) || value === '') {
+              (option as HTMLElement).style.display = 'block';
+            } else {
+              (option as HTMLElement).style.display = 'none';
+            }
+          });
+          
+          ownersDropdown.classList.remove('hidden');
+        });
+        
+        // Assemble the components
+        fieldContainer.appendChild(label);
+        addressWrapper.appendChild(input);
+        addressWrapper.appendChild(ownersDropdown);
+        fieldContainer.appendChild(addressWrapper);
+      } else {
+        fieldContainer.appendChild(label);
+        fieldContainer.appendChild(input);
+      }
+      form.appendChild(fieldContainer);
+    });
+
+    // Assemble the form
+    formContainer.appendChild(title);
+    formContainer.appendChild(form);
+    this.buffer.appendChild(formContainer);
+  }
+
   private updateTitle() {
     document.title = `Minimalist Safe{Wallet}`;
+  }
+
+  private async loadAndCacheSafeInfo(): Promise<void> {
+    if (!this.safeAddress) return;
+
+    try {
+      // Fetch balance
+      const balance = await this.provider.getBalance(this.safeAddress);
+      const balanceInEth = ethers.formatEther(balance);
+
+      // Emit getSafeInfo to get owners and threshold
+      return new Promise((resolve) => {
+        this.socket.emit('getSafeInfo', { safeAddress: this.safeAddress });
+        
+        // One-time listener for the response
+        this.socket.once('safeInfo', async (data: { address: string; owners: string[]; threshold: number }) => {
+          // Resolve ENS names for all owners
+          const ensNames: { [address: string]: string | null } = {};
+          for (const owner of data.owners) {
+            ensNames[owner] = await this.resolveEnsName(owner);
+          }
+
+          // Cache the data
+          this.cachedSafeInfo = {
+            owners: data.owners,
+            threshold: data.threshold,
+            balance: balanceInEth,
+            ensNames
+          };
+
+          resolve();
+        });
+      });
+    } catch (error) {
+      console.error('Failed to load Safe info:', error);
+    }
+  }
+
+  private clearSafeInfoCache(): void {
+    this.cachedSafeInfo = null;
+  }
+
+  private displaySafeInfo(info: SafeInfo): void {
+    this.buffer.innerHTML = '';
+
+    // Owners Box
+    const ownersBox = document.createElement('div');
+    ownersBox.className = 'bg-gray-800 p-6 rounded-lg border border-gray-700 w-full max-w-2xl mb-4 shadow-lg';
+
+    const ownersLabel = document.createElement('h3');
+    ownersLabel.className = 'text-blue-400 font-bold mb-2';
+    ownersLabel.textContent = 'Owners:';
+
+    const ownersList = document.createElement('ul');
+    ownersList.className = 'mb-4';
+    for (const owner of info.owners) {
+      const ensName = info.ensNames[owner];
+      const ownerItem = document.createElement('li');
+      ownerItem.className = 'text-gray-300';
+      ownerItem.textContent = ensName ? `${owner} (${ensName})` : owner;
+      ownersList.appendChild(ownerItem);
+    }
+
+    ownersBox.appendChild(ownersLabel);
+    ownersBox.appendChild(ownersList);
+
+    // Threshold Box
+    const thresholdBox = document.createElement('div');
+    thresholdBox.className = 'bg-gray-800 p-6 rounded-lg border border-gray-700 w-full max-w-2xl shadow-lg';
+
+    const thresholdLabel = document.createElement('p');
+    thresholdLabel.className = 'text-blue-400 font-bold';
+    thresholdLabel.textContent = 'Threshold:';
+
+    const thresholdValue = document.createElement('p');
+    thresholdValue.className = 'text-gray-300 mb-2';
+    thresholdValue.textContent = `${info.threshold} out of ${info.owners.length} signers.`;
+
+    thresholdBox.appendChild(thresholdLabel);
+    thresholdBox.appendChild(thresholdValue);
+
+    // Append both boxes to buffer
+    this.buffer.appendChild(ownersBox);
+    this.buffer.appendChild(thresholdBox);
+    this.buffer.className = 'flex-1 p-4 overflow-y-auto';
   }
 }
 
